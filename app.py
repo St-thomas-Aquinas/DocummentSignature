@@ -1,16 +1,16 @@
 import os
 import uuid
 import hashlib
-import base64
 import requests
+
 from flask import Flask, request, send_from_directory
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
-
 from pypdf import PdfReader, PdfWriter
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 # =========================
 # CONFIG
@@ -18,99 +18,101 @@ from pypdf import PdfReader, PdfWriter
 
 app = Flask(__name__)
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+client = Client(TWILIO_SID, TWILIO_TOKEN)
 
-UPLOAD_FOLDER = "uploads"
-SIGNED_FOLDER = "signed"
+UPLOAD_DIR = "uploads"
+SIGNED_DIR = "signed"
 
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(SIGNED_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(SIGNED_DIR, exist_ok=True)
 
-# Simple session store (use DB in production)
 sessions = {}
 
 # =========================
-# DOWNLOAD FILE FROM TWILIO
+# DOWNLOAD FILE
 # =========================
 
-def download_file(url, filename):
-    response = requests.get(url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-    with open(filename, "wb") as f:
-        f.write(response.content)
+def download_file(url, path):
+    r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
+    with open(path, "wb") as f:
+        f.write(r.content)
 
 # =========================
-# SIGN PDF
+# KEY DERIVATION FROM PASSWORD
 # =========================
 
-def sign_pdf(pdf_path, private_key_text):
+def generate_keypair_from_secret(secret: str):
+    """
+    Turn "Max124wells" into deterministic private key
+    """
 
-    private_key = serialization.load_pem_private_key(
-        private_key_text.encode(),
-        password=None
-    )
+    seed = hashlib.sha256(secret.encode()).digest()
+
+    private_key = Ed25519PrivateKey.from_private_bytes(seed)
 
     public_key = private_key.public_key()
 
-    public_key_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
+    return private_key, public_key
 
-    # Read file bytes
+# =========================
+# SIGN DOCUMENT
+# =========================
+
+def sign_document(pdf_path, secret):
+
+    private_key, public_key = generate_keypair_from_secret(secret)
+
+    # read file
     with open(pdf_path, "rb") as f:
         pdf_bytes = f.read()
 
-    # Hash document
-    document_hash = hashlib.sha256(pdf_bytes).digest()
+    doc_hash = hashlib.sha256(pdf_bytes).digest()
 
-    # Sign hash
-    signature = private_key.sign(
-        document_hash,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH
-        ),
-        hashes.SHA256()
-    )
+    signature = private_key.sign(doc_hash)
 
-    signature_b64 = base64.b64encode(signature).decode()
+    signature_hex = signature.hex()
 
-    # Write signed PDF
+    public_key_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    ).hex()
+
+    # write pdf
     reader = PdfReader(pdf_path)
     writer = PdfWriter()
 
-    for page in reader.pages:
-        writer.add_page(page)
+    for p in reader.pages:
+        writer.add_page(p)
 
     metadata = reader.metadata or {}
 
     metadata.update({
-        "/Signature": signature_b64,
-        "/DocumentHash": document_hash.hex(),
-        "/PublicKey": public_key_pem,
-        "/Algorithm": "RSA-SHA256"
+        "/Signature": signature_hex,
+        "/DocumentHash": doc_hash.hex(),
+        "/PublicKey": public_key_bytes,
+        "/Algorithm": "Ed25519-SHA256"
     })
 
     writer.add_metadata(metadata)
 
-    signed_filename = f"signed_{uuid.uuid4().hex}.pdf"
-    signed_path = os.path.join(SIGNED_FOLDER, signed_filename)
+    out_name = f"signed_{uuid.uuid4().hex}.pdf"
+    out_path = os.path.join(SIGNED_DIR, out_name)
 
-    with open(signed_path, "wb") as f:
+    with open(out_path, "wb") as f:
         writer.write(f)
 
-    return signed_filename
+    return out_name
 
 # =========================
-# SERVE SIGNED FILE
+# SERVE FILE
 # =========================
 
 @app.route("/signed/<filename>")
 def serve_file(filename):
-    return send_from_directory(SIGNED_FOLDER, filename, as_attachment=True)
+    return send_from_directory(SIGNED_DIR, filename, as_attachment=True)
 
 # =========================
 # WEBHOOK
@@ -119,83 +121,72 @@ def serve_file(filename):
 @app.route("/webhook", methods=["POST"])
 def webhook():
 
-    msg_body = request.values.get("Body", "").strip()
-    from_number = request.values.get("From")
+    msg = request.values.get("Body", "").strip()
+    from_user = request.values.get("From")
     num_media = int(request.values.get("NumMedia", 0))
 
     resp = MessagingResponse()
     reply = resp.message()
 
-    # =========================
     # STEP 1: RECEIVE PDF
-    # =========================
-
     if num_media > 0:
 
         media_url = request.values.get("MediaUrl0")
         media_type = request.values.get("MediaContentType0")
 
         if media_type != "application/pdf":
-            reply.body("❌ Please send a PDF file only.")
+            reply.body("Send PDF only.")
             return str(resp)
 
         filename = f"{uuid.uuid4().hex}.pdf"
-        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        path = os.path.join(UPLOAD_DIR, filename)
 
-        download_file(media_url, filepath)
+        download_file(media_url, path)
 
-        sessions[from_number] = {
-            "pdf_path": filepath,
-            "stage": "awaiting_key"
+        sessions[from_user] = {
+            "pdf": path,
+            "stage": "awaiting_secret"
         }
 
-        reply.body("📄 PDF received.\n\n🔑 Now paste your RSA PRIVATE KEY (PEM format).")
+        reply.body("PDF received.\nNow type your secret key (e.g. Max124wells)")
         return str(resp)
 
-    # =========================
-    # STEP 2: RECEIVE PRIVATE KEY
-    # =========================
+    # STEP 2: RECEIVE SECRET
+    if from_user in sessions:
 
-    if from_number in sessions:
+        session = sessions[from_user]
 
-        session = sessions[from_number]
-
-        if session["stage"] == "awaiting_key":
+        if session["stage"] == "awaiting_secret":
 
             try:
-                private_key_text = msg_body
-                pdf_path = session["pdf_path"]
+                secret = msg
+                pdf_path = session["pdf"]
 
-                signed_filename = sign_pdf(pdf_path, private_key_text)
+                signed_file = sign_document(pdf_path, secret)
 
-                public_url = request.host_url + "signed/" + signed_filename
+                public_url = request.host_url + "signed/" + signed_file
 
-                # Send back file
                 client.messages.create(
                     from_="whatsapp:+14155238886",
-                    to=from_number,
-                    body="✅ Your document has been signed successfully.",
+                    to=from_user,
+                    body="Signed document ready ✅",
                     media_url=[public_url]
                 )
 
-                del sessions[from_number]
+                del sessions[from_user]
 
-                reply.body("📤 Signed document sent back to you.")
+                reply.body("Done. Check your WhatsApp file.")
                 return str(resp)
 
             except Exception as e:
-                reply.body(f"❌ Signing failed:\n{str(e)}")
+                reply.body(f"Error: {str(e)}")
                 return str(resp)
 
-    # =========================
-    # DEFAULT
-    # =========================
-
-    reply.body("📎 Send a PDF document to begin signing.")
+    reply.body("Send a PDF to begin.")
     return str(resp)
 
 # =========================
-# RUN APP
+# RUN
 # =========================
 
 if __name__ == "__main__":
