@@ -1,0 +1,6 @@
+flask
+twilio
+cryptography
+pypdf
+requests
+gunicorn
