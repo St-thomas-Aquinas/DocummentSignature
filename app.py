@@ -1,221 +1,472 @@
+# =========================================
+# app.py
+# =========================================
+
 import os
 import uuid
+import sqlite3
 import hashlib
 import base64
-import requests
 
-from flask import Flask, request, send_from_directory
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.rest import Client
+from flask import (
+    Flask,
+    render_template,
+    request,
+    redirect,
+    url_for,
+    flash,
+    session,
+    send_from_directory
+)
 
-from pypdf import PdfReader, PdfWriter
+from werkzeug.security import (
+    generate_password_hash,
+    check_password_hash
+)
+
+from cryptography.fernet import Fernet
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey
 )
+
 from cryptography.hazmat.primitives import serialization
 
-# =========================
-# APP SETUP
-# =========================
+from pypdf import PdfReader, PdfWriter
+
+# =========================================
+# CONFIG
+# =========================================
 
 app = Flask(__name__)
 
-TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+app.secret_key = "CHANGE_THIS_SECRET"
 
-client = Client(TWILIO_SID, TWILIO_TOKEN)
+UPLOAD_FOLDER = "uploads"
+SIGNED_FOLDER = "signed"
 
-UPLOAD_DIR = "uploads"
-SIGNED_DIR = "signed"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(SIGNED_FOLDER, exist_ok=True)
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(SIGNED_DIR, exist_ok=True)
+# =========================================
+# DATABASE
+# =========================================
 
-# =========================
-# DATABASE (simple in-memory)
-# =========================
+conn = sqlite3.connect(
+    "users.db",
+    check_same_thread=False
+)
 
-users = {}  
-# format:
-# users[phone] = {
-#   "private_key": ...,
-#   "public_key": ...
-# }
+cursor = conn.cursor()
 
-sessions = {}
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password_hash TEXT,
+    public_key TEXT,
+    encrypted_private_key TEXT
+)
+""")
 
-# =========================
-# DOWNLOAD FILE
-# =========================
+conn.commit()
 
-def download_file(url, path):
-    r = requests.get(url, auth=(TWILIO_SID, TWILIO_TOKEN))
-    with open(path, "wb") as f:
-        f.write(r.content)
+# =========================================
+# HELPERS
+# =========================================
 
-# =========================
-# REGISTER USER (ASYMMETRIC KEYPAIR)
-# =========================
+def derive_key(password):
 
-def register_user(phone):
+    digest = hashlib.sha256(
+        password.encode()
+    ).digest()
+
+    return base64.urlsafe_b64encode(digest)
+
+# =========================================
+# REGISTER USER
+# =========================================
+
+def register_user(username, password):
 
     private_key = Ed25519PrivateKey.generate()
+
     public_key = private_key.public_key()
 
-    users[phone] = {
-        "private_key": private_key,
-        "public_key": public_key
-    }
+    private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption()
+    )
 
-# =========================
-# SIGN DOCUMENT
-# =========================
+    public_bytes = public_key.public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw
+    )
 
-def sign_pdf(pdf_path, private_key):
+    cipher = Fernet(
+        derive_key(password)
+    )
+
+    encrypted_private_key = cipher.encrypt(
+        private_bytes
+    )
+
+    cursor.execute("""
+    INSERT INTO users
+    (
+        username,
+        password_hash,
+        public_key,
+        encrypted_private_key
+    )
+    VALUES (?, ?, ?, ?)
+    """, (
+        username,
+        generate_password_hash(password),
+        public_bytes.hex(),
+        encrypted_private_key.decode()
+    ))
+
+    conn.commit()
+
+# =========================================
+# LOAD PRIVATE KEY
+# =========================================
+
+def load_private_key(username, password):
+
+    cursor.execute("""
+    SELECT encrypted_private_key
+    FROM users
+    WHERE username=?
+    """, (username,))
+
+    row = cursor.fetchone()
+
+    encrypted_private_key = row[0]
+
+    cipher = Fernet(
+        derive_key(password)
+    )
+
+    private_bytes = cipher.decrypt(
+        encrypted_private_key.encode()
+    )
+
+    private_key = Ed25519PrivateKey.from_private_bytes(
+        private_bytes
+    )
+
+    return private_key
+
+# =========================================
+# SIGN PDF
+# =========================================
+
+def sign_pdf(pdf_path, username, private_key):
 
     with open(pdf_path, "rb") as f:
-        data = f.read()
+        pdf_data = f.read()
 
-    doc_hash = hashlib.sha256(data).digest()
+    document_hash = hashlib.sha256(
+        pdf_data
+    ).digest()
 
-    signature = private_key.sign(doc_hash)
+    signature = private_key.sign(
+        document_hash
+    )
 
-    return signature, doc_hash
+    cursor.execute("""
+    SELECT public_key
+    FROM users
+    WHERE username=?
+    """, (username,))
 
-# =========================
-# VERIFY DOCUMENT
-# =========================
+    public_key = cursor.fetchone()[0]
 
-def verify_pdf(pdf_path, public_key, signature_hex, hash_hex):
+    reader = PdfReader(pdf_path)
+    writer = PdfWriter()
 
-    with open(pdf_path, "rb") as f:
-        data = f.read()
+    for page in reader.pages:
+        writer.add_page(page)
 
-    current_hash = hashlib.sha256(data).digest()
+    metadata = reader.metadata or {}
 
-    stored_hash = bytes.fromhex(hash_hex)
+    metadata.update({
+        "/Signature": signature.hex(),
+        "/DocumentHash": document_hash.hex(),
+        "/PublicKey": public_key,
+        "/Signer": username,
+        "/Algorithm": "Ed25519"
+    })
+
+    writer.add_metadata(metadata)
+
+    output_name = (
+        f"signed_{uuid.uuid4().hex}.pdf"
+    )
+
+    output_path = os.path.join(
+        SIGNED_FOLDER,
+        output_name
+    )
+
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+    return output_name
+
+# =========================================
+# VERIFY PDF
+# =========================================
+
+def verify_pdf(pdf_path):
+
+    reader = PdfReader(pdf_path)
+
+    metadata = reader.metadata
+
+    if not metadata:
+        return False, "No metadata found"
+
+    signature_hex = metadata.get("/Signature")
+    stored_hash_hex = metadata.get("/DocumentHash")
+    public_key_hex = metadata.get("/PublicKey")
+    signer = metadata.get("/Signer")
+
+    if not all([
+        signature_hex,
+        stored_hash_hex,
+        public_key_hex
+    ]):
+        return False, "Missing metadata"
+
     signature = bytes.fromhex(signature_hex)
 
+    stored_hash = bytes.fromhex(
+        stored_hash_hex
+    )
+
+    with open(pdf_path, "rb") as f:
+        current_data = f.read()
+
+    current_hash = hashlib.sha256(
+        current_data
+    ).digest()
+
     if current_hash != stored_hash:
-        return False, "Document modified"
+        return False, (
+            "Document was modified"
+        )
+
+    public_key = Ed25519PublicKey.from_public_bytes(
+        bytes.fromhex(public_key_hex)
+    )
 
     try:
-        public_key.verify(signature, stored_hash)
-        return True, "VALID SIGNATURE"
+
+        public_key.verify(
+            signature,
+            stored_hash
+        )
+
+        return (
+            True,
+            f"VALID SIGNATURE\nSigned by: {signer}"
+        )
+
     except:
-        return False, "INVALID SIGNATURE"
 
-# =========================
-# SAVE FILE ROUTE
-# =========================
-
-@app.route("/signed/<file>")
-def serve(file):
-    return send_from_directory(SIGNED_DIR, file, as_attachment=True)
-
-# =========================
-# WEBHOOK
-# =========================
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-
-    msg = request.values.get("Body", "").strip()
-    phone = request.values.get("From")
-    num_media = int(request.values.get("NumMedia", 0))
-
-    resp = MessagingResponse()
-    reply = resp.message()
-
-    # =========================
-    # REGISTER COMMAND
-    # =========================
-
-    if msg.lower() == "register":
-
-        register_user(phone)
-
-        reply.body(
-            "Account created ✅\n\n"
-            "Your asymmetric keypair is ready.\n"
-            "Send a PDF to sign."
-        )
-        return str(resp)
-
-    # =========================
-    # PDF RECEIVED
-    # =========================
-
-    if num_media > 0:
-
-        if phone not in users:
-            reply.body("Send REGISTER first.")
-            return str(resp)
-
-        media_url = request.values.get("MediaUrl0")
-
-        filename = f"{uuid.uuid4().hex}.pdf"
-        path = os.path.join(UPLOAD_DIR, filename)
-
-        download_file(media_url, path)
-
-        private_key = users[phone]["private_key"]
-
-        signature, doc_hash = sign_pdf(path, private_key)
-
-        public_key = users[phone]["public_key"]
-
-        # save metadata
-        reader = PdfReader(path)
-        writer = PdfWriter()
-
-        for p in reader.pages:
-            writer.add_page(p)
-
-        metadata = reader.metadata or {}
-
-        metadata.update({
-            "/Signature": signature.hex(),
-            "/DocumentHash": doc_hash.hex(),
-            "/PublicKey": public_key.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ).hex(),
-            "/Algorithm": "Ed25519"
-        })
-
-        writer.add_metadata(metadata)
-
-        out_name = f"signed_{uuid.uuid4().hex}.pdf"
-        out_path = os.path.join(SIGNED_DIR, out_name)
-
-        with open(out_path, "wb") as f:
-            writer.write(f)
-
-        url = request.host_url + "signed/" + out_name
-
-        client.messages.create(
-            from_="whatsapp:+14155238886",
-            to=phone,
-            body="Signed document ready ✅",
-            media_url=[url]
+        return (
+            False,
+            "INVALID SIGNATURE"
         )
 
-        reply.body("Processing done.")
-        return str(resp)
+# =========================================
+# ROUTES
+# =========================================
 
-    # =========================
-    # DEFAULT
-    # =========================
+@app.route("/")
+def home():
+    return render_template("index.html")
 
-    reply.body("Send REGISTER or a PDF.")
-    return str(resp)
+# =========================================
+# REGISTER
+# =========================================
 
-# =========================
+@app.route("/register", methods=["GET", "POST"])
+def register():
+
+    if request.method == "POST":
+
+        username = request.form["username"]
+        password = request.form["password"]
+
+        try:
+
+            register_user(
+                username,
+                password
+            )
+
+            flash(
+                "Registration successful"
+            )
+
+            return redirect(
+                url_for("login")
+            )
+
+        except Exception as e:
+
+            flash(str(e))
+
+    return render_template(
+        "register.html"
+    )
+
+# =========================================
+# LOGIN
+# =========================================
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+
+        username = request.form["username"]
+        password = request.form["password"]
+
+        cursor.execute("""
+        SELECT password_hash
+        FROM users
+        WHERE username=?
+        """, (username,))
+
+        row = cursor.fetchone()
+
+        if row and check_password_hash(
+            row[0],
+            password
+        ):
+
+            session["username"] = username
+            session["password"] = password
+
+            return redirect(
+                url_for("dashboard")
+            )
+
+        flash("Invalid credentials")
+
+    return render_template(
+        "login.html"
+    )
+
+# =========================================
+# DASHBOARD
+# =========================================
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+
+    if "username" not in session:
+        return redirect(url_for("login"))
+
+    signed_file = None
+
+    if request.method == "POST":
+
+        uploaded = request.files["pdf"]
+
+        if uploaded.filename == "":
+            flash("Select PDF")
+            return redirect(
+                url_for("dashboard")
+            )
+
+        file_path = os.path.join(
+            UPLOAD_FOLDER,
+            f"{uuid.uuid4().hex}.pdf"
+        )
+
+        uploaded.save(file_path)
+
+        private_key = load_private_key(
+            session["username"],
+            session["password"]
+        )
+
+        signed_file = sign_pdf(
+            file_path,
+            session["username"],
+            private_key
+        )
+
+    return render_template(
+        "dashboard.html",
+        signed_file=signed_file
+    )
+
+# =========================================
+# VERIFY
+# =========================================
+
+@app.route("/verify", methods=["GET", "POST"])
+def verify():
+
+    result = None
+
+    if request.method == "POST":
+
+        uploaded = request.files["pdf"]
+
+        path = os.path.join(
+            UPLOAD_FOLDER,
+            f"verify_{uuid.uuid4().hex}.pdf"
+        )
+
+        uploaded.save(path)
+
+        valid, result = verify_pdf(path)
+
+    return render_template(
+        "verify.html",
+        result=result
+    )
+
+# =========================================
+# DOWNLOAD
+# =========================================
+
+@app.route("/download/<filename>")
+def download(filename):
+
+    return send_from_directory(
+        SIGNED_FOLDER,
+        filename,
+        as_attachment=True
+    )
+
+# =========================================
+# LOGOUT
+# =========================================
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return redirect(url_for("login"))
+
+# =========================================
 # RUN
-# =========================
+# =========================================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+
+    app.run(
+        debug=True
+    )
