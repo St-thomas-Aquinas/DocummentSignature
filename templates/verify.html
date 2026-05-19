@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<div class="card shadow">
+
+<div class="card-body">
+
+    <h2 class="mb-4">
+        Verify Signed PDF
+    </h2>
+
+    <form method="POST" enctype="multipart/form-data">
+
+        <div class="mb-3">
+
+            <input
+                type="file"
+                name="pdf"
+                class="form-control"
+                accept=".pdf"
+                required
+            >
+
+        </div>
+
+        <button class="btn btn-dark">
+            Verify Document
+        </button>
+
+    </form>
+
+    {% if result %}
+
+        <hr>
+
+        <div class="alert alert-info">
+
+            {{ result }}
+
+        </div>
+
+    {% endif %}
+
+</div>
+
+</div>
+
+{% endblock %}
