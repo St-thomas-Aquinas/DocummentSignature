@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+
+{% block content %}
+
+<h2 class="mb-4">
+    Welcome {{ session.username }}
+</h2>
+
+<div class="card shadow">
+
+<div class="card-body">
+
+    <h4 class="mb-4">
+        Sign PDF Document
+    </h4>
+
+    <form method="POST" enctype="multipart/form-data">
+
+        <div class="mb-3">
+
+            <input
+                type="file"
+                name="pdf"
+                class="form-control"
+                accept=".pdf"
+                required
+            >
+
+        </div>
+
+        <button class="btn btn-success">
+            Sign Document
+        </button>
+
+    </form>
+
+    {% if signed_file %}
+
+        <hr>
+
+        <div class="alert alert-success">
+
+            Document signed successfully.
+
+        </div>
+
+        <a
+            href="/download/{{ signed_file }}"
+            class="btn btn-primary"
+        >
+            Download Signed PDF
+        </a>
+
+    {% endif %}
+
+</div>
+
+</div>
+
+{% endblock %}
