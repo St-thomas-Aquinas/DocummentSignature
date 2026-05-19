@@ -277,8 +277,8 @@ def verify():
 
         valid, result = verify_file(path)
 
-    #return render_template("verify.html", result=result)
-     return result 
+    return render_template(result)
+     
 
 # -------- DOWNLOAD --------
 @app.route("/download/<filename>")
