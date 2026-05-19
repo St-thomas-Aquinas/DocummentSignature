@@ -4,3 +4,4 @@ cryptography
 pypdf
 requests
 gunicorn
+werkzeug
