@@ -2,32 +2,38 @@ import os
 import sqlite3
 import json
 import requests
+from flask import Flask, request, jsonify
 
-# ==========================================
-# ENV VARIABLES
-# ==========================================
+# ==============================
+# ENV VARIABLES (RENDER SAFE)
+# ==============================
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GIST_ID = os.environ.get("GIST_ID")
 
 if not GITHUB_TOKEN:
-    raise Exception("Missing GITHUB_TOKEN")
+    print("WARNING: Missing GITHUB_TOKEN")
 
 if not GIST_ID:
-    raise Exception("Missing GIST_ID")
+    print("WARNING: Missing GIST_ID")
 
-# ==========================================
+# ==============================
+# FLASK APP (IMPORTANT FIX)
+# ==============================
+
+app = Flask(__name__)   # 🔥 THIS MUST EXIST FOR GUNICORN
+
+# ==============================
 # DATABASE
-# ==========================================
+# ==============================
 
-DATABASE_FILE = "users.db"
+DB = "users.db"
 
-def initialize_database():
+def init_db():
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
@@ -40,21 +46,21 @@ def initialize_database():
     conn.commit()
     conn.close()
 
-# ==========================================
-# EXPORT DATABASE
-# ==========================================
+# ==============================
+# EXPORT DB
+# ==============================
 
-def export_database():
+def export_db():
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         SELECT username, password_hash, public_key, encrypted_private_key
         FROM users
     """)
 
-    rows = cursor.fetchall()
+    rows = cur.fetchall()
     conn.close()
 
     users = []
@@ -67,15 +73,17 @@ def export_database():
             "encrypted_private_key": r[3]
         })
 
-    return json.dumps(users, indent=4)
+    return json.dumps(users, indent=2)
 
-# ==========================================
-# BACKUP TO GIST (AUTO SYNC)
-# ==========================================
+# ==============================
+# BACKUP TO GIST
+# ==============================
 
 def backup_to_gist():
 
-    content = export_database()
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("Backup skipped (missing env vars)")
+        return
 
     url = f"https://api.github.com/gists/{GIST_ID}"
 
@@ -86,26 +94,27 @@ def backup_to_gist():
     payload = {
         "files": {
             "backup.json": {
-                "content": content
+                "content": export_db()
             }
         }
     }
 
-    response = requests.patch(url, headers=headers, json=payload)
+    r = requests.patch(url, headers=headers, json=payload)
 
-    if response.status_code == 200:
-        print("✔ Backup synced to Gist")
+    if r.status_code == 200:
+        print("Backup success")
     else:
-        print("❌ Backup failed")
-        print(response.text)
+        print("Backup failed:", r.text)
 
-# ==========================================
+# ==============================
 # RESTORE FROM GIST
-# ==========================================
+# ==============================
 
 def restore_from_gist():
 
-    print("Checking remote backup...")
+    if not GITHUB_TOKEN or not GIST_ID:
+        print("Restore skipped (missing env vars)")
+        return
 
     url = f"https://api.github.com/gists/{GIST_ID}"
 
@@ -113,35 +122,25 @@ def restore_from_gist():
         "Authorization": f"token {GITHUB_TOKEN}"
     }
 
-    response = requests.get(url, headers=headers)
+    r = requests.get(url, headers=headers)
 
-    if response.status_code != 200:
-        print("Failed to load Gist")
+    if r.status_code != 200:
+        print("Restore failed")
         return
 
-    gist = response.json()
-    content = gist["files"]["backup.json"]["content"]
+    data = r.json()
+    content = data["files"]["backup.json"]["content"]
 
     users = json.loads(content)
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
-
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        public_key TEXT,
-        encrypted_private_key TEXT
-    )
-    """)
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
 
     for u in users:
-        cursor.execute("""
-            INSERT OR REPLACE INTO users
-            (username, password_hash, public_key, encrypted_private_key)
-            VALUES (?, ?, ?, ?)
+        cur.execute("""
+        INSERT OR REPLACE INTO users
+        (username, password_hash, public_key, encrypted_private_key)
+        VALUES (?, ?, ?, ?)
         """, (
             u["username"],
             u["password_hash"],
@@ -152,26 +151,29 @@ def restore_from_gist():
     conn.commit()
     conn.close()
 
-    print("✔ Database restored")
+    print("Restore complete")
 
-# ==========================================
-# ADD USER (AUTO BACKUP HERE)
-# ==========================================
+# ==============================
+# ADD USER (AUTO BACKUP)
+# ==============================
 
+@app.route("/add_user", methods=["POST"])
 def add_user():
 
-    username = input("Username: ")
-    password_hash = input("Password hash: ")
-    public_key = input("Public key: ")
-    encrypted_private_key = input("Encrypted private key: ")
+    data = request.json
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    username = data["username"]
+    password_hash = data["password_hash"]
+    public_key = data["public_key"]
+    encrypted_private_key = data["encrypted_private_key"]
 
-    cursor.execute("""
-        INSERT OR REPLACE INTO users
-        (username, password_hash, public_key, encrypted_private_key)
-        VALUES (?, ?, ?, ?)
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT OR REPLACE INTO users
+    (username, password_hash, public_key, encrypted_private_key)
+    VALUES (?, ?, ?, ?)
     """, (
         username,
         password_hash,
@@ -182,69 +184,43 @@ def add_user():
     conn.commit()
     conn.close()
 
-    print("✔ User added")
-
-    # 🔥 AUTO SYNC TO GIST EVERY TIME USER IS CREATED
+    # 🔥 AUTO BACKUP EVERY TIME USER IS CREATED
     backup_to_gist()
 
-# ==========================================
+    return jsonify({"status": "user added and backed up"})
+
+# ==============================
 # VIEW USERS
-# ==========================================
+# ==============================
 
-def view_users():
+@app.route("/users", methods=["GET"])
+def users():
 
-    conn = sqlite3.connect(DATABASE_FILE)
-    cursor = conn.cursor()
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
 
-    cursor.execute("SELECT id, username, public_key FROM users")
+    cur.execute("SELECT username, public_key FROM users")
 
-    rows = cursor.fetchall()
-
-    for r in rows:
-        print(r)
-
+    rows = cur.fetchall()
     conn.close()
 
-# ==========================================
-# MENU
-# ==========================================
+    return jsonify(rows)
 
-def menu():
+# ==============================
+# HOME ROUTE
+# ==============================
 
-    initialize_database()
-    restore_from_gist()
+@app.route("/")
+def home():
+    return "Server Running"
 
-    while True:
-
-        print("\n1. Add user")
-        print("2. View users")
-        print("3. Backup now")
-        print("4. Restore now")
-        print("5. Exit")
-
-        choice = input("Choose: ")
-
-        if choice == "1":
-            add_user()
-
-        elif choice == "2":
-            view_users()
-
-        elif choice == "3":
-            backup_to_gist()
-
-        elif choice == "4":
-            restore_from_gist()
-
-        elif choice == "5":
-            break
-
-        else:
-            print("Invalid")
-
-# ==========================================
-# START
-# ==========================================
+# ==============================
+# STARTUP
+# ==============================
 
 if __name__ == "__main__":
-    menu()
+
+    init_db()
+    restore_from_gist()
+
+    app.run(host="0.0.0.0", port=5000, debug=True)
