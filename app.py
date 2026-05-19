@@ -13,14 +13,14 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
 
-# =========================================
-# APP CONFIG
-# =========================================
+# =========================
+# APP SETUP
+# =========================
 
 app = Flask(__name__)
 app.secret_key = "CHANGE_THIS_SECRET"
 
-app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20MB upload limit
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20MB limit
 
 UPLOAD_FOLDER = "uploads"
 SIGNED_FOLDER = "signed"
@@ -28,9 +28,9 @@ SIGNED_FOLDER = "signed"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SIGNED_FOLDER, exist_ok=True)
 
-# =========================================
+# =========================
 # DATABASE
-# =========================================
+# =========================
 
 conn = sqlite3.connect("users.db", check_same_thread=False)
 cursor = conn.cursor()
@@ -44,24 +44,22 @@ CREATE TABLE IF NOT EXISTS users (
     encrypted_private_key TEXT
 )
 """)
-
 conn.commit()
 
-# =========================================
+# =========================
 # HELPERS
-# =========================================
+# =========================
 
 def derive_key(password):
-    digest = hashlib.sha256(password.encode()).digest()
-    return base64.urlsafe_b64encode(digest)
+    return base64.urlsafe_b64encode(hashlib.sha256(password.encode()).digest())
 
 def get_file_hash(file_path):
     with open(file_path, "rb") as f:
         return hashlib.sha256(f.read()).digest()
 
-# =========================================
-# REGISTER USER
-# =========================================
+# =========================
+# USER REGISTRATION
+# =========================
 
 def register_user(username, password):
 
@@ -80,33 +78,27 @@ def register_user(username, password):
     )
 
     cipher = Fernet(derive_key(password))
-    encrypted_private_key = cipher.encrypt(private_bytes)
+    encrypted_private = cipher.encrypt(private_bytes)
 
     cursor.execute("""
-        INSERT INTO users
-        (username, password_hash, public_key, encrypted_private_key)
+        INSERT INTO users (username, password_hash, public_key, encrypted_private_key)
         VALUES (?, ?, ?, ?)
     """, (
         username,
         generate_password_hash(password),
         public_bytes.hex(),
-        encrypted_private_key.decode()
+        encrypted_private.decode()
     ))
 
     conn.commit()
 
-# =========================================
+# =========================
 # LOAD PRIVATE KEY
-# =========================================
+# =========================
 
 def load_private_key(username, password):
 
-    cursor.execute("""
-        SELECT encrypted_private_key
-        FROM users
-        WHERE username=?
-    """, (username,))
-
+    cursor.execute("SELECT encrypted_private_key FROM users WHERE username=?", (username,))
     row = cursor.fetchone()
 
     if not row:
@@ -117,19 +109,16 @@ def load_private_key(username, password):
 
     return Ed25519PrivateKey.from_private_bytes(private_bytes)
 
-# =========================================
+# =========================
 # SIGN FILE
-# =========================================
+# =========================
 
-def sign_document(file_path, username, private_key):
+def sign_file(file_path, username, private_key):
 
     file_hash = get_file_hash(file_path)
     signature = private_key.sign(file_hash)
 
-    cursor.execute("""
-        SELECT public_key FROM users WHERE username=?
-    """, (username,))
-
+    cursor.execute("SELECT public_key FROM users WHERE username=?", (username,))
     public_key = cursor.fetchone()[0]
 
     output_name = f"signed_{uuid.uuid4().hex}{os.path.splitext(file_path)[1]}"
@@ -142,7 +131,7 @@ def sign_document(file_path, username, private_key):
     with open(output_path, "wb") as f:
         f.write(data)
 
-    # metadata file
+    # metadata
     meta = {
         "signature": signature.hex(),
         "hash": file_hash.hex(),
@@ -156,22 +145,22 @@ def sign_document(file_path, username, private_key):
 
     return output_name
 
-# =========================================
+# =========================
 # VERIFY FILE
-# =========================================
+# =========================
 
 def verify_file(file_path):
 
     meta_path = file_path + ".meta"
 
     if not os.path.exists(meta_path):
-        return False, "Missing signature metadata"
+        return False, "Missing metadata file"
 
     try:
         with open(meta_path, "r") as f:
             meta = json.load(f)
-    except Exception:
-        return False, "Corrupted metadata file"
+    except:
+        return False, "Corrupted metadata"
 
     signature = bytes.fromhex(meta["signature"])
     stored_hash = bytes.fromhex(meta["hash"])
@@ -180,24 +169,22 @@ def verify_file(file_path):
 
     current_hash = get_file_hash(file_path)
 
-    # STEP 1: integrity check
     if current_hash != stored_hash:
         return False, "Document was modified"
 
-    # STEP 2: signature verification
     public_key = Ed25519PublicKey.from_public_bytes(
         bytes.fromhex(public_key_hex)
     )
 
     try:
         public_key.verify(signature, stored_hash)
-        return True, f"VALID SIGNATURE - Signed by {signer}"
+        return True, f"VALID - Signed by {signer}"
     except:
         return False, "INVALID SIGNATURE"
 
-# =========================================
+# =========================
 # ROUTES
-# =========================================
+# =========================
 
 @app.route("/")
 def home():
@@ -208,16 +195,9 @@ def home():
 def register():
 
     if request.method == "POST":
-
-        username = request.form.get("username")
-        password = request.form.get("password")
-
-        try:
-            register_user(username, password)
-            flash("Registration successful")
-            return redirect(url_for("login"))
-        except Exception as e:
-            flash(str(e))
+        register_user(request.form["username"], request.form["password"])
+        flash("Registered successfully")
+        return redirect("/login")
 
     return render_template("register.html")
 
@@ -227,62 +207,50 @@ def login():
 
     if request.method == "POST":
 
-        username = request.form.get("username")
-        password = request.form.get("password")
+        username = request.form["username"]
+        password = request.form["password"]
 
-        cursor.execute("""
-            SELECT password_hash FROM users WHERE username=?
-        """, (username,))
-
+        cursor.execute("SELECT password_hash FROM users WHERE username=?", (username,))
         row = cursor.fetchone()
 
         if row and check_password_hash(row[0], password):
-
             session["username"] = username
             session["password"] = password
+            return redirect("/dashboard")
 
-            return redirect(url_for("dashboard"))
-
-        flash("Invalid credentials")
+        flash("Invalid login")
 
     return render_template("login.html")
 
-# ---------- DASHBOARD ----------
+# ---------- DASHBOARD (SIGN) ----------
 @app.route("/dashboard", methods=["GET", "POST"])
 def dashboard():
 
     if "username" not in session:
-        return redirect(url_for("login"))
+        return redirect("/login")
 
-    signed_file = None
+    result = None
 
     if request.method == "POST":
 
         if "file" not in request.files:
             flash("No file uploaded")
-            return redirect(url_for("dashboard"))
+            return redirect("/dashboard")
 
-        uploaded = request.files["file"]
+        file = request.files["file"]
 
-        if uploaded.filename == "":
+        if file.filename == "":
             flash("No file selected")
-            return redirect(url_for("dashboard"))
+            return redirect("/dashboard")
 
-        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{uploaded.filename}")
-        uploaded.save(path)
+        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{file.filename}")
+        file.save(path)
 
-        private_key = load_private_key(
-            session["username"],
-            session["password"]
-        )
+        private_key = load_private_key(session["username"], session["password"])
 
-        signed_file = sign_document(
-            path,
-            session["username"],
-            private_key
-        )
+        result = sign_file(path, session["username"], private_key)
 
-    return render_template("dashboard.html", signed_file=signed_file)
+    return render_template("dashboard.html", result=result)
 
 # ---------- VERIFY ----------
 @app.route("/verify", methods=["GET", "POST"])
@@ -294,16 +262,12 @@ def verify():
 
         if "file" not in request.files:
             flash("No file uploaded")
-            return redirect(url_for("verify"))
+            return redirect("/verify")
 
-        uploaded = request.files["file"]
+        file = request.files["file"]
 
-        if uploaded.filename == "":
-            flash("No file selected")
-            return redirect(url_for("verify"))
-
-        path = os.path.join(UPLOAD_FOLDER, f"verify_{uuid.uuid4().hex}_{uploaded.filename}")
-        uploaded.save(path)
+        path = os.path.join(UPLOAD_FOLDER, f"verify_{uuid.uuid4().hex}_{file.filename}")
+        file.save(path)
 
         valid, result = verify_file(path)
 
@@ -318,11 +282,11 @@ def download(filename):
 @app.route("/logout")
 def logout():
     session.clear()
-    return redirect(url_for("login"))
+    return redirect("/login")
 
-# =========================================
+# =========================
 # RUN
-# =========================================
+# =========================
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(debug=True, host="0.0.0.0", port=5000)
