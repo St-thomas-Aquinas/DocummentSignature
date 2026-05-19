@@ -6,6 +6,8 @@ import json
 import psycopg2
 import requests
 
+from requests.auth import HTTPBasicAuth
+
 from flask import (
     Flask,
     render_template,
@@ -32,9 +34,9 @@ from cryptography.hazmat.primitives import serialization
 
 from twilio.twiml.messaging_response import MessagingResponse
 
-# =========================
-# APP SETUP
-# =========================
+# =========================================
+# APP CONFIG
+# =========================================
 
 app = Flask(__name__)
 
@@ -49,11 +51,25 @@ SIGNED_FOLDER = "signed"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SIGNED_FOLDER, exist_ok=True)
 
-# =========================
-# DATABASE (RENDER POSTGRES)
-# =========================
+# =========================================
+# TWILIO CONFIG
+# =========================================
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+TWILIO_ACCOUNT_SID = os.environ.get(
+    "TWILIO_ACCOUNT_SID"
+)
+
+TWILIO_AUTH_TOKEN = os.environ.get(
+    "TWILIO_AUTH_TOKEN"
+)
+
+# =========================================
+# DATABASE CONFIG
+# =========================================
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL"
+)
 
 def get_db():
 
@@ -62,9 +78,9 @@ def get_db():
         sslmode="require"
     )
 
-# =========================
-# INIT DB
-# =========================
+# =========================================
+# INIT DATABASE
+# =========================================
 
 def init_db():
 
@@ -87,9 +103,9 @@ def init_db():
 with app.app_context():
     init_db()
 
-# =========================
+# =========================================
 # HELPERS
-# =========================
+# =========================================
 
 SIGNATURE_MARKER = b"__SIGNATURE_BLOCK__"
 
@@ -103,26 +119,17 @@ def get_file_hash(data: bytes):
 
     return hashlib.sha256(data).digest()
 
-# =========================
+# =========================================
 # REGISTER USER
-# =========================
+# =========================================
 
 def register_user(username, password):
 
     conn = get_db()
     cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE,
-        password_hash TEXT,
-        public_key TEXT,
-        encrypted_private_key TEXT
-    )
-    """)
-
     private_key = Ed25519PrivateKey.generate()
+
     public_key = private_key.public_key()
 
     private_bytes = private_key.private_bytes(
@@ -144,37 +151,27 @@ def register_user(username, password):
         private_bytes
     )
 
-    try:
+    cur.execute("""
+    INSERT INTO users (
+        username,
+        password_hash,
+        public_key,
+        encrypted_private_key
+    )
+    VALUES (%s, %s, %s, %s)
+    """, (
+        username,
+        generate_password_hash(password),
+        public_bytes.hex(),
+        encrypted_private.decode()
+    ))
 
-        cur.execute("""
-        INSERT INTO users (
-            username,
-            password_hash,
-            public_key,
-            encrypted_private_key
-        )
-        VALUES (%s, %s, %s, %s)
-        """, (
-            username,
-            generate_password_hash(password),
-            public_bytes.hex(),
-            encrypted_private.decode()
-        ))
-
-        conn.commit()
-
-    except Exception as e:
-
-        conn.rollback()
-        conn.close()
-
-        raise e
-
+    conn.commit()
     conn.close()
 
-# =========================
+# =========================================
 # LOAD PRIVATE KEY
-# =========================
+# =========================================
 
 def load_private_key(username, password):
 
@@ -206,9 +203,9 @@ def load_private_key(username, password):
         private_bytes
     )
 
-# =========================
+# =========================================
 # GET PUBLIC KEY
-# =========================
+# =========================================
 
 def get_public_key(username):
 
@@ -230,25 +227,27 @@ def get_public_key(username):
 
     return row[0]
 
-# =========================
+# =========================================
 # SIGN FILE
-# =========================
+# =========================================
 
 def sign_file(file_path, username, private_key):
 
     with open(file_path, "rb") as f:
-        file_data = f.read()
+        original_data = f.read()
 
-    # HASH FILE
-    file_hash = get_file_hash(file_data)
+    file_hash = get_file_hash(
+        original_data
+    )
 
-    # SIGN HASH
-    signature = private_key.sign(file_hash)
+    signature = private_key.sign(
+        file_hash
+    )
 
-    # GET PUBLIC KEY
-    public_key = get_public_key(username)
+    public_key = get_public_key(
+        username
+    )
 
-    # METADATA
     metadata = {
         "signature": signature.hex(),
         "hash": file_hash.hex(),
@@ -265,17 +264,18 @@ def sign_file(file_path, username, private_key):
         file_path
     )[1]
 
-    output_name = f"signed_{uuid.uuid4().hex}{extension}"
+    output_name = (
+        f"signed_{uuid.uuid4().hex}{extension}"
+    )
 
     output_path = os.path.join(
         SIGNED_FOLDER,
         output_name
     )
 
-    # EMBED SIGNATURE
     with open(output_path, "wb") as f:
 
-        f.write(file_data)
+        f.write(original_data)
 
         f.write(SIGNATURE_MARKER)
 
@@ -283,9 +283,9 @@ def sign_file(file_path, username, private_key):
 
     return output_name
 
-# =========================
+# =========================================
 # VERIFY FILE
-# =========================
+# =========================================
 
 def verify_file(file_path):
 
@@ -298,7 +298,7 @@ def verify_file(file_path):
 
     try:
 
-        file_data, metadata_bytes = data.split(
+        original_data, metadata_bytes = data.split(
             SIGNATURE_MARKER
         )
 
@@ -308,7 +308,7 @@ def verify_file(file_path):
 
     except:
 
-        return False, "Corrupted signature block"
+        return False, "Corrupted signature metadata"
 
     signature = bytes.fromhex(
         metadata["signature"]
@@ -322,14 +322,14 @@ def verify_file(file_path):
 
     signer = metadata["signer"]
 
-    # VERIFY FILE INTEGRITY
-    current_hash = get_file_hash(file_data)
+    current_hash = get_file_hash(
+        original_data
+    )
 
     if current_hash != stored_hash:
 
         return False, "Document was modified"
 
-    # VERIFY SIGNATURE
     public_key = Ed25519PublicKey.from_public_bytes(
         bytes.fromhex(public_key_hex)
     )
@@ -341,24 +341,26 @@ def verify_file(file_path):
             stored_hash
         )
 
-        return True, f"VALID SIGNATURE - Signed by {signer}"
+        return True, (
+            f"VALID SIGNATURE - Signed by {signer}"
+        )
 
     except:
 
         return False, "INVALID SIGNATURE"
 
-# =========================
+# =========================================
 # HOME
-# =========================
+# =========================================
 
 @app.route("/")
 def home():
 
     return render_template("index.html")
 
-# =========================
+# =========================================
 # REGISTER
-# =========================
+# =========================================
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
@@ -382,9 +384,9 @@ def register():
 
     return render_template("register.html")
 
-# =========================
+# =========================================
 # LOGIN
-# =========================
+# =========================================
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -417,13 +419,13 @@ def login():
 
             return redirect("/dashboard")
 
-        flash("Invalid credentials")
+        flash("Invalid login")
 
     return render_template("login.html")
 
-# =========================
+# =========================================
 # DASHBOARD
-# =========================
+# =========================================
 
 @app.route("/dashboard", methods=["GET", "POST"])
 def dashboard():
@@ -481,9 +483,9 @@ def dashboard():
         signed_file=signed_file
     )
 
-# =========================
+# =========================================
 # VERIFY WEB
-# =========================
+# =========================================
 
 @app.route("/verify", methods=["GET", "POST"])
 def verify():
@@ -532,9 +534,9 @@ def verify():
         result=result
     )
 
-# =========================
-# WHATSAPP VERIFY ENDPOINT
-# =========================
+# =========================================
+# WHATSAPP VERIFY BOT
+# =========================================
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -543,33 +545,39 @@ def whatsapp():
 
     try:
 
-        media_url = request.form.get("MediaUrl0")
+        media_url = request.form.get(
+            "MediaUrl0"
+        )
 
         if not media_url:
 
             resp.message(
-                "📄 Please send a signed document to verify."
+                "📄 Send a signed document for verification."
             )
 
             return str(resp)
 
-        # DOWNLOAD FILE
-        file_response = requests.get(media_url)
+        # DOWNLOAD FILE FROM TWILIO
+        file_response = requests.get(
+            media_url,
+            auth=HTTPBasicAuth(
+                TWILIO_ACCOUNT_SID,
+                TWILIO_AUTH_TOKEN
+            )
+        )
 
         if file_response.status_code != 200:
 
             resp.message(
-                "❌ Failed to download file."
+                f"❌ Failed to download file.\nStatus: {file_response.status_code}"
             )
 
             return str(resp)
 
         # SAVE FILE
-        filename = f"wa_{uuid.uuid4().hex}"
-
         path = os.path.join(
             UPLOAD_FOLDER,
-            filename
+            f"wa_{uuid.uuid4().hex}"
         )
 
         with open(path, "wb") as f:
@@ -581,7 +589,7 @@ def whatsapp():
         if valid:
 
             resp.message(
-                f"🔐 VERIFIED\n\n{result}"
+                f"✅ VERIFIED\n\n{result}"
             )
 
         else:
@@ -598,9 +606,9 @@ def whatsapp():
 
     return str(resp)
 
-# =========================
+# =========================================
 # DOWNLOAD
-# =========================
+# =========================================
 
 @app.route("/download/<filename>")
 def download(filename):
@@ -611,9 +619,9 @@ def download(filename):
         as_attachment=True
     )
 
-# =========================
+# =========================================
 # LOGOUT
-# =========================
+# =========================================
 
 @app.route("/logout")
 def logout():
@@ -622,9 +630,9 @@ def logout():
 
     return redirect("/login")
 
-# =========================
+# =========================================
 # START
-# =========================
+# =========================================
 
 if __name__ == "__main__":
 
