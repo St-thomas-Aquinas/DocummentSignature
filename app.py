@@ -27,7 +27,7 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SIGNED_FOLDER, exist_ok=True)
 
 # =========================
-# POSTGRES CONFIG (RENDER)
+# DATABASE (RENDER POSTGRES)
 # =========================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
@@ -36,14 +36,14 @@ def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 # =========================
-# INIT DB
+# INIT DB (CRITICAL FIX)
 # =========================
 
 def init_db():
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         username TEXT UNIQUE,
@@ -55,6 +55,10 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+# 🔥 FORCE INIT ON STARTUP (IMPORTANT)
+with app.app_context():
+    init_db()
 
 # =========================
 # HELPERS
@@ -74,6 +78,20 @@ def get_file_hash(data: bytes):
 
 def register_user(username, password):
 
+    conn = get_db()
+    cur = conn.cursor()
+
+    # 🔥 SAFETY: ensure table exists even if startup failed
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        public_key TEXT,
+        encrypted_private_key TEXT
+    )
+    """)
+
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
 
@@ -91,21 +109,24 @@ def register_user(username, password):
     cipher = Fernet(derive_key(password))
     encrypted_private = cipher.encrypt(private_bytes)
 
-    conn = get_db()
-    cursor = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO users (username, password_hash, public_key, encrypted_private_key)
+            VALUES (%s, %s, %s, %s)
+        """, (
+            username,
+            generate_password_hash(password),
+            public_bytes.hex(),
+            encrypted_private.decode()
+        ))
 
-    cursor.execute("""
-        INSERT INTO users (username, password_hash, public_key, encrypted_private_key)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT (username) DO NOTHING
-    """, (
-        username,
-        generate_password_hash(password),
-        public_bytes.hex(),
-        encrypted_private.decode()
-    ))
+        conn.commit()
 
-    conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise e
+
     conn.close()
 
 # =========================
@@ -115,15 +136,15 @@ def register_user(username, password):
 def load_private_key(username, password):
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("""
+    cur.execute("""
         SELECT encrypted_private_key
         FROM users
         WHERE username=%s
     """, (username,))
 
-    row = cursor.fetchone()
+    row = cur.fetchone()
     conn.close()
 
     cipher = Fernet(derive_key(password))
@@ -138,12 +159,15 @@ def load_private_key(username, password):
 def get_public_key(username):
 
     conn = get_db()
-    cursor = conn.cursor()
+    cur = conn.cursor()
 
-    cursor.execute("SELECT public_key FROM users WHERE username=%s", (username,))
-    row = cursor.fetchone()
+    cur.execute("""
+        SELECT public_key FROM users WHERE username=%s
+    """, (username,))
 
+    row = cur.fetchone()
     conn.close()
+
     return row[0]
 
 # =========================
@@ -218,7 +242,7 @@ def verify_file(file_path):
         return False, "INVALID SIGNATURE"
 
 # =========================
-# ROUTES (UNCHANGED UI)
+# ROUTES
 # =========================
 
 @app.route("/")
@@ -228,22 +252,30 @@ def home():
 @app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        register_user(request.form["username"], request.form["password"])
-        return redirect("/login")
+        try:
+            register_user(request.form["username"], request.form["password"])
+            return redirect("/login")
+        except Exception as e:
+            return f"ERROR: {str(e)}"
+
     return render_template("register.html")
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+
     if request.method == "POST":
 
         username = request.form["username"]
         password = request.form["password"]
 
         conn = get_db()
-        cursor = conn.cursor()
+        cur = conn.cursor()
 
-        cursor.execute("SELECT password_hash FROM users WHERE username=%s", (username,))
-        row = cursor.fetchone()
+        cur.execute("""
+            SELECT password_hash FROM users WHERE username=%s
+        """, (username,))
+
+        row = cur.fetchone()
         conn.close()
 
         if row and check_password_hash(row[0], password):
@@ -306,5 +338,4 @@ def logout():
 # =========================
 
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True, host="0.0.0.0", port=5000)
