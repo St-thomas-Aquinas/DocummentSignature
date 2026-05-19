@@ -5,3 +5,4 @@ pypdf
 requests
 gunicorn
 werkzeug
+psycopg2-binary
