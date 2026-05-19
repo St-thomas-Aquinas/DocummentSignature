@@ -22,6 +22,7 @@ from werkzeug.security import (
 )
 
 from cryptography.fernet import Fernet
+
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey
@@ -32,7 +33,7 @@ from cryptography.hazmat.primitives import serialization
 from twilio.twiml.messaging_response import MessagingResponse
 
 # =========================================
-# APP CONFIG
+# APP SETUP
 # =========================================
 
 app = Flask(__name__)
@@ -49,12 +50,13 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SIGNED_FOLDER, exist_ok=True)
 
 # =========================================
-# POSTGRES DATABASE
+# DATABASE (RENDER POSTGRES)
 # =========================================
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 def get_db():
+
     return psycopg2.connect(
         DATABASE_URL,
         sslmode="require"
@@ -107,6 +109,21 @@ def get_file_hash(data: bytes):
 
 def register_user(username, password):
 
+    conn = get_db()
+    cur = conn.cursor()
+
+    # Ensure table exists
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        public_key TEXT,
+        encrypted_private_key TEXT
+    )
+    """)
+
+    # Generate keypair
     private_key = Ed25519PrivateKey.generate()
     public_key = private_key.public_key()
 
@@ -121,15 +138,14 @@ def register_user(username, password):
         format=serialization.PublicFormat.Raw
     )
 
+    # Encrypt private key
     cipher = Fernet(derive_key(password))
 
-    encrypted_private_key = cipher.encrypt(
+    encrypted_private = cipher.encrypt(
         private_bytes
     )
 
-    conn = get_db()
-    cur = conn.cursor()
-
+    # Save user
     cur.execute("""
     INSERT INTO users (
         username,
@@ -142,7 +158,7 @@ def register_user(username, password):
         username,
         generate_password_hash(password),
         public_bytes.hex(),
-        encrypted_private_key.decode()
+        encrypted_private.decode()
     ))
 
     conn.commit()
@@ -166,6 +182,9 @@ def load_private_key(username, password):
     row = cur.fetchone()
 
     conn.close()
+
+    if not row:
+        raise Exception("User not found")
 
     cipher = Fernet(derive_key(password))
 
@@ -196,6 +215,9 @@ def get_public_key(username):
 
     conn.close()
 
+    if not row:
+        raise Exception("Public key not found")
+
     return row[0]
 
 # =========================================
@@ -207,12 +229,16 @@ def sign_file(file_path, username, private_key):
     with open(file_path, "rb") as f:
         file_data = f.read()
 
+    # Hash file
     file_hash = get_file_hash(file_data)
 
+    # Sign hash
     signature = private_key.sign(file_hash)
 
+    # Get public key
     public_key = get_public_key(username)
 
+    # Metadata
     metadata = {
         "signature": signature.hex(),
         "hash": file_hash.hex(),
@@ -223,6 +249,7 @@ def sign_file(file_path, username, private_key):
 
     metadata_bytes = json.dumps(metadata).encode()
 
+    # Output file
     extension = os.path.splitext(file_path)[1]
 
     output_name = f"signed_{uuid.uuid4().hex}{extension}"
@@ -232,11 +259,11 @@ def sign_file(file_path, username, private_key):
         output_name
     )
 
+    # Embed signature block
     with open(output_path, "wb") as f:
 
         f.write(file_data)
 
-        # embed signature block
         f.write(SIGNATURE_MARKER)
 
         f.write(metadata_bytes)
@@ -252,11 +279,13 @@ def verify_file(file_path):
     with open(file_path, "rb") as f:
         data = f.read()
 
+    # Check marker
     if SIGNATURE_MARKER not in data:
         return False, "No embedded signature found"
 
     try:
 
+        # Split original data and metadata
         file_data, metadata_bytes = data.split(
             SIGNATURE_MARKER
         )
@@ -268,6 +297,7 @@ def verify_file(file_path):
     except:
         return False, "Corrupted signature block"
 
+    # Extract metadata
     signature = bytes.fromhex(
         metadata["signature"]
     )
@@ -280,19 +310,13 @@ def verify_file(file_path):
 
     signer = metadata["signer"]
 
-    # --------------------------------
-    # recompute original file hash
-    # --------------------------------
-
+    # Recalculate hash
     current_hash = get_file_hash(file_data)
 
     if current_hash != stored_hash:
         return False, "Document was modified"
 
-    # --------------------------------
-    # verify cryptographic signature
-    # --------------------------------
-
+    # Verify signature
     public_key = Ed25519PublicKey.from_public_bytes(
         bytes.fromhex(public_key_hex)
     )
@@ -311,11 +335,12 @@ def verify_file(file_path):
         return False, "INVALID SIGNATURE"
 
 # =========================================
-# ROUTES
+# HOME
 # =========================================
 
 @app.route("/")
 def home():
+
     return render_template("index.html")
 
 # =========================================
@@ -343,7 +368,7 @@ def register():
 
         except Exception as e:
 
-            return f"ERROR: {str(e)}"
+            flash(str(e))
 
     return render_template("register.html")
 
@@ -394,41 +419,57 @@ def login():
 def dashboard():
 
     if "username" not in session:
+
         return redirect("/login")
 
     signed_file = None
 
     if request.method == "POST":
 
+        # Ensure file exists
         if "file" not in request.files:
 
             flash("No file uploaded")
+
             return redirect("/dashboard")
 
-        uploaded = request.files["file"]
+        file = request.files["file"]
 
-        if uploaded.filename == "":
+        # Ensure filename exists
+        if file.filename == "":
 
-            flash("Select a file")
+            flash("Please select a file")
+
             return redirect("/dashboard")
 
-        path = os.path.join(
-            UPLOAD_FOLDER,
-            f"{uuid.uuid4().hex}_{uploaded.filename}"
-        )
+        try:
 
-        uploaded.save(path)
+            # Save uploaded file
+            path = os.path.join(
+                UPLOAD_FOLDER,
+                f"{uuid.uuid4().hex}_{file.filename}"
+            )
 
-        private_key = load_private_key(
-            session["username"],
-            session["password"]
-        )
+            file.save(path)
 
-        signed_file = sign_file(
-            path,
-            session["username"],
-            private_key
-        )
+            # Load private key
+            private_key = load_private_key(
+                session["username"],
+                session["password"]
+            )
+
+            # Sign document
+            signed_file = sign_file(
+                path,
+                session["username"],
+                private_key
+            )
+
+            flash("Document signed successfully")
+
+        except Exception as e:
+
+            flash(f"Signing failed: {str(e)}")
 
     return render_template(
         "dashboard.html",
@@ -455,25 +496,31 @@ def verify():
                 result=result
             )
 
-        uploaded = request.files["file"]
+        file = request.files["file"]
 
-        if uploaded.filename == "":
+        if file.filename == "":
 
-            result = "No file selected"
+            result = "Please select a file"
 
             return render_template(
                 "verify.html",
                 result=result
             )
 
-        path = os.path.join(
-            UPLOAD_FOLDER,
-            f"verify_{uuid.uuid4().hex}_{uploaded.filename}"
-        )
+        try:
 
-        uploaded.save(path)
+            path = os.path.join(
+                UPLOAD_FOLDER,
+                f"verify_{uuid.uuid4().hex}_{file.filename}"
+            )
 
-        valid, result = verify_file(path)
+            file.save(path)
+
+            valid, result = verify_file(path)
+
+        except Exception as e:
+
+            result = f"Verification failed: {str(e)}"
 
     return render_template(
         "verify.html",
@@ -485,7 +532,7 @@ def verify():
 # =========================================
 
 @app.route("/whatsapp", methods=["POST"])
-def whatsapp_webhook():
+def whatsapp():
 
     resp = MessagingResponse()
 
@@ -501,7 +548,7 @@ def whatsapp_webhook():
 
     try:
 
-        # download file from Twilio
+        # Download media
         file_data = requests.get(media_url).content
 
         filename = f"wa_{uuid.uuid4().hex}"
@@ -514,7 +561,7 @@ def whatsapp_webhook():
         with open(path, "wb") as f:
             f.write(file_data)
 
-        # verify file
+        # Verify
         valid, result = verify_file(path)
 
         if valid:
@@ -568,7 +615,7 @@ def logout():
 if __name__ == "__main__":
 
     app.run(
+        debug=True,
         host="0.0.0.0",
-        port=5000,
-        debug=True
+        port=5000
     )
