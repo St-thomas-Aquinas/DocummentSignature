@@ -1,265 +1,250 @@
 import os
-import uuid
 import sqlite3
-import hashlib
-import base64
 import json
+import requests
 
-from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory
+# ==========================================
+# ENV VARIABLES
+# ==========================================
 
-from werkzeug.security import generate_password_hash, check_password_hash
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+GIST_ID = os.environ.get("GIST_ID")
 
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
-from cryptography.hazmat.primitives import serialization
+if not GITHUB_TOKEN:
+    raise Exception("Missing GITHUB_TOKEN")
 
-# =========================
-# APP SETUP
-# =========================
+if not GIST_ID:
+    raise Exception("Missing GIST_ID")
 
-app = Flask(__name__)
-app.secret_key = "CHANGE_THIS_SECRET"
-
-UPLOAD_FOLDER = "uploads"
-SIGNED_FOLDER = "signed"
-
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(SIGNED_FOLDER, exist_ok=True)
-
-# =========================
+# ==========================================
 # DATABASE
-# =========================
+# ==========================================
 
-conn = sqlite3.connect("users.db", check_same_thread=False)
-cursor = conn.cursor()
+DATABASE_FILE = "users.db"
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE,
-    password_hash TEXT,
-    public_key TEXT,
-    encrypted_private_key TEXT
-)
-""")
-conn.commit()
+def initialize_database():
 
-# =========================
-# HELPERS
-# =========================
-
-SIGNATURE_MARKER = b"__SIGNATURE_BLOCK__"
-
-
-def derive_key(password):
-    return base64.urlsafe_b64encode(hashlib.sha256(password.encode()).digest())
-
-
-def get_file_hash(data: bytes):
-    return hashlib.sha256(data).digest()
-
-# =========================
-# REGISTER USER
-# =========================
-
-def register_user(username, password):
-
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
-
-    private_bytes = private_key.private_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PrivateFormat.Raw,
-        encryption_algorithm=serialization.NoEncryption()
-    )
-
-    public_bytes = public_key.public_bytes(
-        encoding=serialization.Encoding.Raw,
-        format=serialization.PublicFormat.Raw
-    )
-
-    cipher = Fernet(derive_key(password))
-    encrypted_private = cipher.encrypt(private_bytes)
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO users (username, password_hash, public_key, encrypted_private_key)
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        public_key TEXT,
+        encrypted_private_key TEXT
+    )
+    """)
+
+    conn.commit()
+    conn.close()
+
+# ==========================================
+# EXPORT DATABASE
+# ==========================================
+
+def export_database():
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT username, password_hash, public_key, encrypted_private_key
+        FROM users
+    """)
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    users = []
+
+    for r in rows:
+        users.append({
+            "username": r[0],
+            "password_hash": r[1],
+            "public_key": r[2],
+            "encrypted_private_key": r[3]
+        })
+
+    return json.dumps(users, indent=4)
+
+# ==========================================
+# BACKUP TO GIST (AUTO SYNC)
+# ==========================================
+
+def backup_to_gist():
+
+    content = export_database()
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
+
+    payload = {
+        "files": {
+            "backup.json": {
+                "content": content
+            }
+        }
+    }
+
+    response = requests.patch(url, headers=headers, json=payload)
+
+    if response.status_code == 200:
+        print("✔ Backup synced to Gist")
+    else:
+        print("❌ Backup failed")
+        print(response.text)
+
+# ==========================================
+# RESTORE FROM GIST
+# ==========================================
+
+def restore_from_gist():
+
+    print("Checking remote backup...")
+
+    url = f"https://api.github.com/gists/{GIST_ID}"
+
+    headers = {
+        "Authorization": f"token {GITHUB_TOKEN}"
+    }
+
+    response = requests.get(url, headers=headers)
+
+    if response.status_code != 200:
+        print("Failed to load Gist")
+        return
+
+    gist = response.json()
+    content = gist["files"]["backup.json"]["content"]
+
+    users = json.loads(content)
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE,
+        password_hash TEXT,
+        public_key TEXT,
+        encrypted_private_key TEXT
+    )
+    """)
+
+    for u in users:
+        cursor.execute("""
+            INSERT OR REPLACE INTO users
+            (username, password_hash, public_key, encrypted_private_key)
+            VALUES (?, ?, ?, ?)
+        """, (
+            u["username"],
+            u["password_hash"],
+            u["public_key"],
+            u["encrypted_private_key"]
+        ))
+
+    conn.commit()
+    conn.close()
+
+    print("✔ Database restored")
+
+# ==========================================
+# ADD USER (AUTO BACKUP HERE)
+# ==========================================
+
+def add_user():
+
+    username = input("Username: ")
+    password_hash = input("Password hash: ")
+    public_key = input("Public key: ")
+    encrypted_private_key = input("Encrypted private key: ")
+
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO users
+        (username, password_hash, public_key, encrypted_private_key)
         VALUES (?, ?, ?, ?)
     """, (
         username,
-        generate_password_hash(password),
-        public_bytes.hex(),
-        encrypted_private.decode()
+        password_hash,
+        public_key,
+        encrypted_private_key
     ))
 
     conn.commit()
+    conn.close()
 
-# =========================
-# LOAD PRIVATE KEY
-# =========================
+    print("✔ User added")
 
-def load_private_key(username, password):
+    # 🔥 AUTO SYNC TO GIST EVERY TIME USER IS CREATED
+    backup_to_gist()
 
-    cursor.execute("SELECT encrypted_private_key FROM users WHERE username=?", (username,))
-    row = cursor.fetchone()
+# ==========================================
+# VIEW USERS
+# ==========================================
 
-    cipher = Fernet(derive_key(password))
-    private_bytes = cipher.decrypt(row[0].encode())
+def view_users():
 
-    return Ed25519PrivateKey.from_private_bytes(private_bytes)
+    conn = sqlite3.connect(DATABASE_FILE)
+    cursor = conn.cursor()
 
-# =========================
-# SIGN FILE (EMBEDDED)
-# =========================
+    cursor.execute("SELECT id, username, public_key FROM users")
 
-def sign_file(file_path, username, private_key):
+    rows = cursor.fetchall()
 
-    with open(file_path, "rb") as f:
-        file_data = f.read()
+    for r in rows:
+        print(r)
 
-    file_hash = get_file_hash(file_data)
-    signature = private_key.sign(file_hash)
+    conn.close()
 
-    cursor.execute("SELECT public_key FROM users WHERE username=?", (username,))
-    public_key = cursor.fetchone()[0]
+# ==========================================
+# MENU
+# ==========================================
 
-    metadata = {
-        "signature": signature.hex(),
-        "hash": file_hash.hex(),
-        "public_key": public_key,
-        "signer": username,
-        "algorithm": "Ed25519"
-    }
+def menu():
 
-    meta_bytes = json.dumps(metadata).encode()
+    initialize_database()
+    restore_from_gist()
 
-    output_name = f"signed_{uuid.uuid4().hex}{os.path.splitext(file_path)[1]}"
-    output_path = os.path.join(SIGNED_FOLDER, output_name)
+    while True:
 
-    with open(output_path, "wb") as f:
-        f.write(file_data)
-        f.write(SIGNATURE_MARKER)
-        f.write(meta_bytes)
+        print("\n1. Add user")
+        print("2. View users")
+        print("3. Backup now")
+        print("4. Restore now")
+        print("5. Exit")
 
-    return output_name
+        choice = input("Choose: ")
 
-# =========================
-# VERIFY FILE (EMBEDDED)
-# =========================
+        if choice == "1":
+            add_user()
 
-def verify_file(file_path):
+        elif choice == "2":
+            view_users()
 
-    with open(file_path, "rb") as f:
-        data = f.read()
+        elif choice == "3":
+            backup_to_gist()
 
-    if SIGNATURE_MARKER not in data:
-        return False, "No embedded signature found"
+        elif choice == "4":
+            restore_from_gist()
 
-    file_data, meta_bytes = data.split(SIGNATURE_MARKER)
+        elif choice == "5":
+            break
 
-    try:
-        meta = json.loads(meta_bytes.decode())
-    except:
-        return False, "Corrupted signature block"
+        else:
+            print("Invalid")
 
-    signature = bytes.fromhex(meta["signature"])
-    stored_hash = bytes.fromhex(meta["hash"])
-    public_key_hex = meta["public_key"]
-    signer = meta["signer"]
-
-    current_hash = get_file_hash(file_data)
-
-    if current_hash != stored_hash:
-        return False, "Document was modified"
-
-    public_key = Ed25519PublicKey.from_public_bytes(
-        bytes.fromhex(public_key_hex)
-    )
-
-    try:
-        public_key.verify(signature, stored_hash)
-        return True, f"VALID SIGNATURE - Signed by {signer}"
-    except:
-        return False, "INVALID SIGNATURE"
-
-# =========================
-# ROUTES
-# =========================
-
-@app.route("/")
-def home():
-    return render_template("index.html")
-
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        register_user(request.form["username"], request.form["password"])
-        return redirect("/login")
-    return render_template("register.html")
-
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-
-        username = request.form["username"]
-        password = request.form["password"]
-
-        cursor.execute("SELECT password_hash FROM users WHERE username=?", (username,))
-        row = cursor.fetchone()
-
-        if row and check_password_hash(row[0], password):
-            session["username"] = username
-            session["password"] = password
-            return redirect("/dashboard")
-
-        flash("Invalid login")
-
-    return render_template("login.html")
-
-@app.route("/dashboard", methods=["GET", "POST"])
-def dashboard():
-
-    if "username" not in session:
-        return redirect("/login")
-
-    result = None
-
-    if request.method == "POST":
-
-        file = request.files["file"]
-
-        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{file.filename}")
-        file.save(path)
-
-        private_key = load_private_key(session["username"], session["password"])
-
-        result = sign_file(path, session["username"], private_key)
-
-    return render_template("dashboard.html", result=result)
-
-@app.route("/verify", methods=["GET", "POST"])
-def verify():
-
-    result = None
-
-    if request.method == "POST":
-
-        file = request.files["file"]
-
-        path = os.path.join(UPLOAD_FOLDER, f"verify_{uuid.uuid4().hex}_{file.filename}")
-        file.save(path)
-
-        valid, result = verify_file(path)
-
-    return render_template("verify.html", result=result)
-
-@app.route("/download/<filename>")
-def download(filename):
-    return send_from_directory(SIGNED_FOLDER, filename, as_attachment=True)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect("/login")
+# ==========================================
+# START
+# ==========================================
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    menu()
