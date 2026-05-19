@@ -3,6 +3,7 @@ import uuid
 import sqlite3
 import hashlib
 import base64
+import json
 
 from flask import Flask, render_template, request, redirect, url_for, flash, session, send_from_directory
 
@@ -11,8 +12,6 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 from cryptography.hazmat.primitives import serialization
-
-from pypdf import PdfReader, PdfWriter
 
 # =========================================
 # APP CONFIG
@@ -55,7 +54,15 @@ def derive_key(password):
     return base64.urlsafe_b64encode(digest)
 
 # =========================================
-# REGISTER
+# RAW FILE HASH (IMPORTANT)
+# =========================================
+
+def get_file_hash(file_path):
+    with open(file_path, "rb") as f:
+        return hashlib.sha256(f.read()).digest()
+
+# =========================================
+# REGISTER USER
 # =========================================
 
 def register_user(username, password):
@@ -110,23 +117,14 @@ def load_private_key(username, password):
     return Ed25519PrivateKey.from_private_bytes(private_bytes)
 
 # =========================================
-# SIGN PDF
+# SIGN ANY FILE
 # =========================================
 
-def sign_pdf(pdf_path, username, private_key):
+def sign_document(file_path, username, private_key):
 
-    reader = PdfReader(pdf_path)
+    file_hash = get_file_hash(file_path)
 
-    text_content = ""
-
-    for page in reader.pages:
-        text_content += page.extract_text() or ""
-
-    document_hash = hashlib.sha256(
-        text_content.encode()
-    ).digest()
-
-    signature = private_key.sign(document_hash)
+    signature = private_key.sign(file_hash)
 
     cursor.execute("""
         SELECT public_key FROM users WHERE username=?
@@ -134,92 +132,56 @@ def sign_pdf(pdf_path, username, private_key):
 
     public_key = cursor.fetchone()[0]
 
-    writer = PdfWriter()
-
-    for page in reader.pages:
-        writer.add_page(page)
-
-    metadata = reader.metadata or {}
-
-    metadata.update({
-        "/Signature": signature.hex(),
-        "/DocumentHash": document_hash.hex(),
-        "/PublicKey": public_key,
-        "/Signer": username,
-        "/Algorithm": "Ed25519"
-    })
-
-    writer.add_metadata(metadata)
-
-    output_name = f"signed_{uuid.uuid4().hex}.pdf"
+    output_name = f"signed_{uuid.uuid4().hex}{os.path.splitext(file_path)[1]}"
     output_path = os.path.join(SIGNED_FOLDER, output_name)
 
+    # copy file as-is
+    with open(file_path, "rb") as f:
+        original = f.read()
+
     with open(output_path, "wb") as f:
-        writer.write(f)
+        f.write(original)
+
+    # metadata sidecar file
+    meta = {
+        "signature": signature.hex(),
+        "hash": file_hash.hex(),
+        "public_key": public_key,
+        "signer": username,
+        "algorithm": "Ed25519"
+    }
+
+    with open(output_path + ".meta", "w") as f:
+        json.dump(meta, f)
 
     return output_name
 
 # =========================================
-# VERIFY PDF (YOUR REQUESTED LOGIC)
+# VERIFY ANY FILE
 # =========================================
 
-def verify_pdf(pdf_path):
+def verify_file(file_path):
 
-    reader = PdfReader(pdf_path)
-    metadata = reader.metadata
+    meta_path = file_path + ".meta"
 
-    if not metadata:
-        return False, "No metadata found"
+    if not os.path.exists(meta_path):
+        return False, "Missing signature metadata"
 
-    signature_hex = metadata.get("/Signature")
-    stored_hash_hex = metadata.get("/DocumentHash")
-    public_key_hex = metadata.get("/PublicKey")
-    signer = metadata.get("/Signer")
+    with open(meta_path, "r") as f:
+        meta = json.load(f)
 
-    if not all([signature_hex, stored_hash_hex, public_key_hex]):
-        return False, "Missing metadata"
+    signature = bytes.fromhex(meta["signature"])
+    stored_hash = bytes.fromhex(meta["hash"])
+    public_key_hex = meta["public_key"]
+    signer = meta["signer"]
 
-    signature = bytes.fromhex(signature_hex)
-    stored_hash = bytes.fromhex(stored_hash_hex)
+    current_hash = get_file_hash(file_path)
 
-    # ======================================================
-    # STEP 1: REMOVE SIGNATURE METADATA (LOGICAL ONLY)
-    # ======================================================
-
-    ignored_keys = {
-        "/Signature",
-        "/DocumentHash",
-        "/PublicKey",
-        "/Signer",
-        "/Algorithm"
-    }
-
-    # (We do NOT rewrite file, just ignore metadata in logic)
-
-    # ======================================================
-    # STEP 2: HASH CLEAN CONTENT (TEXT ONLY)
-    # ======================================================
-
-    text_content = ""
-
-    for page in reader.pages:
-        text_content += page.extract_text() or ""
-
-    current_hash = hashlib.sha256(
-        text_content.encode()
-    ).digest()
-
-    # ======================================================
-    # STEP 3: CHECK HASH
-    # ======================================================
-
+    # STEP 1: Check file integrity
     if current_hash != stored_hash:
         return False, "Document was modified"
 
-    # ======================================================
-    # STEP 4: VERIFY SIGNATURE
-    # ======================================================
-
+    # STEP 2: Verify signature
     public_key = Ed25519PublicKey.from_public_bytes(
         bytes.fromhex(public_key_hex)
     )
@@ -291,13 +253,13 @@ def dashboard():
 
     if request.method == "POST":
 
-        uploaded = request.files["pdf"]
+        uploaded = request.files["file"]
 
         if uploaded.filename == "":
-            flash("Select PDF")
+            flash("Select a file")
             return redirect(url_for("dashboard"))
 
-        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}.pdf")
+        path = os.path.join(UPLOAD_FOLDER, f"{uuid.uuid4().hex}_{uploaded.filename}")
         uploaded.save(path)
 
         private_key = load_private_key(
@@ -305,7 +267,7 @@ def dashboard():
             session["password"]
         )
 
-        signed_file = sign_pdf(
+        signed_file = sign_document(
             path,
             session["username"],
             private_key
@@ -320,12 +282,12 @@ def verify():
 
     if request.method == "POST":
 
-        uploaded = request.files["pdf"]
+        uploaded = request.files["file"]
 
-        path = os.path.join(UPLOAD_FOLDER, f"verify_{uuid.uuid4().hex}.pdf")
+        path = os.path.join(UPLOAD_FOLDER, f"verify_{uuid.uuid4().hex}_{uploaded.filename}")
         uploaded.save(path)
 
-        valid, result = verify_pdf(path)
+        valid, result = verify_file(path)
 
     return render_template("verify.html", result=result)
 
