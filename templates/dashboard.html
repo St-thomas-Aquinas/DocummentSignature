@@ -7,11 +7,10 @@
 </h2>
 
 <div class="card shadow">
-
 <div class="card-body">
 
     <h4 class="mb-4">
-        Sign PDF Document
+        Sign Any Document (PDF, DOCX, XLS, Images)
     </h4>
 
     <form method="POST" enctype="multipart/form-data">
@@ -20,9 +19,8 @@
 
             <input
                 type="file"
-                name="pdf"
+                name="file"
                 class="form-control"
-                accept=".pdf"
                 required
             >
 
@@ -34,27 +32,28 @@
 
     </form>
 
-    {% if signed_file %}
+    {% if result %}
 
         <hr>
 
         <div class="alert alert-success">
+            Document processed successfully.
+        </div>
 
-            Document signed successfully.
-
+        <div class="mt-2">
+            <strong>Result:</strong> {{ result }}
         </div>
 
         <a
-            href="/download/{{ signed_file }}"
-            class="btn btn-primary"
+            href="/download/{{ result }}"
+            class="btn btn-primary mt-3"
         >
-            Download Signed PDF
+            Download Signed File
         </a>
 
     {% endif %}
 
 </div>
-
 </div>
 
 {% endblock %}
