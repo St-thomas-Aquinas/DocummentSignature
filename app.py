@@ -552,7 +552,7 @@ def whatsapp():
         if not media_url:
 
             resp.message(
-                "📄 Send a signed document for verification."
+                "Send a signed document for verification."
             )
 
             return str(resp)
@@ -569,7 +569,7 @@ def whatsapp():
         if file_response.status_code != 200:
 
             resp.message(
-                f"❌ Failed to download file.\nStatus: {file_response.status_code}"
+                f" Failed to download file.\nStatus: {file_response.status_code}"
             )
 
             return str(resp)
@@ -589,19 +589,19 @@ def whatsapp():
         if valid:
 
             resp.message(
-                f"✅ VERIFIED\n\n{result}"
+                f" VERIFIED\n\n{result}"
             )
 
         else:
 
             resp.message(
-                f"❌ INVALID\n\n{result}"
+                f" INVALID\n\n{result}"
             )
 
     except Exception as e:
 
         resp.message(
-            f"❌ Error:\n{str(e)}"
+            f"Error:\n{str(e)}"
         )
 
     return str(resp)
