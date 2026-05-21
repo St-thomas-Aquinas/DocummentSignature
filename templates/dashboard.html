@@ -2,58 +2,81 @@
 
 {% block content %}
 
-<h2 class="mb-4">
-    Welcome {{ session.username }}
-</h2>
+<div class="container mt-5">
 
-<div class="card shadow">
-<div class="card-body">
+    <div class="card shadow p-4">
 
-    <h4 class="mb-4">
-        Sign Any Document (PDF, DOCX, XLS, Images)
-    </h4>
+        <h2 class="mb-4">
+            Welcome {{ session.username }}
+        </h2>
 
-    <form method="POST" enctype="multipart/form-data">
+        <!-- FLASH MESSAGES -->
 
-        <div class="mb-3">
+        {% with messages = get_flashed_messages() %}
+            {% if messages %}
 
-            <input
-                type="file"
-                name="file"
-                class="form-control"
-                required
+                {% for message in messages %}
+
+                    <div class="alert alert-info">
+                        {{ message }}
+                    </div>
+
+                {% endfor %}
+
+            {% endif %}
+        {% endwith %}
+
+        <!-- SIGN FORM -->
+
+        <form method="POST" enctype="multipart/form-data">
+
+            <div class="mb-3">
+
+                <label class="form-label">
+                    Upload Document
+                </label>
+
+                <input
+                    type="file"
+                    name="file"
+                    class="form-control"
+                    required
+                >
+
+            </div>
+
+            <button
+                type="submit"
+                class="btn btn-success"
             >
+                Sign Document
+            </button>
 
-        </div>
+        </form>
 
-        <button class="btn btn-success">
-            Sign Document
-        </button>
+        <!-- DOWNLOAD BUTTON -->
 
-    </form>
+        {% if signed_file %}
 
-    {% if result %}
+            <hr>
 
-        <hr>
+            <div class="alert alert-success mt-3">
 
-        <div class="alert alert-success">
-            Document processed successfully.
-        </div>
+                ✅ Document signed successfully
 
-        <div class="mt-2">
-            <strong>Result:</strong> {{ result }}
-        </div>
+            </div>
 
-        <a
-            href="/download/{{ result }}"
-            class="btn btn-primary mt-3"
-        >
-            Download Signed File
-        </a>
+            <a
+                href="{{ url_for('download', filename=signed_file) }}"
+                class="btn btn-primary"
+            >
+                Download Signed Document
+            </a>
 
-    {% endif %}
+        {% endif %}
 
-</div>
+    </div>
+
 </div>
 
 {% endblock %}
