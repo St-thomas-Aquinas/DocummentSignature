@@ -10,22 +10,6 @@
             Welcome {{ session.username }}
         </h2>
 
-        <!-- FLASH MESSAGES -->
-
-        {% with messages = get_flashed_messages() %}
-            {% if messages %}
-
-                {% for message in messages %}
-
-                    <div class="alert alert-info">
-                        {{ message }}
-                    </div>
-
-                {% endfor %}
-
-            {% endif %}
-        {% endwith %}
-
         <!-- SIGN FORM -->
 
         <form method="POST" enctype="multipart/form-data">
@@ -47,7 +31,7 @@
 
             <button
                 type="submit"
-                class="btn btn-success"
+                class="btn btn-success btn-sm"
             >
                 Sign Document
             </button>
@@ -61,9 +45,7 @@
             <hr>
 
             <div class="alert alert-success mt-3">
-
-                 Document signed successfully
-
+                ✅ Document signed successfully
             </div>
 
             <a
